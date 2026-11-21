@@ -5,6 +5,7 @@ import copy
 import math
 import os
 import queue
+import subprocess
 import threading
 import time
 import urllib.request
@@ -38,16 +39,36 @@ def new_id():
 #  Projektmodell
 # ════════════════════════════════════════════════════════════════════════════
 def new_project():
-    return {"version": 2, "name": "Unbenanntes Projekt", "aspect": "16:9", "bg": "blur",
-            "bg_color": "#000000", "media": {}, "video": [], "overlay": [], "text": [], "audio": []}
+    return {"version": 3, "name": "Unbenanntes Projekt", "aspect": "16:9", "bg": "blur",
+            "bg_color": "#000000", "media": {}, "video": [], "overlay": [], "text": [], "audio": [],
+            "markers": []}
+
+
+def _clip_defaults(c):
+    c.setdefault("chroma", {"on": False, "color": "#00ff00", "tol": 0.3, "soft": 0.12})
+    c.setdefault("blend", "normal")
+    c.setdefault("kf", [])
+    c.setdefault("crop", {"l": 0.0, "r": 0.0, "t": 0.0, "b": 0.0})
+    c.setdefault("radius", 0.0)
+    c.setdefault("border_w", 0.0)
+    c.setdefault("border_color", "#ffffff")
+    c.setdefault("adj", {}).setdefault("blur", 0.0)
+    c.setdefault("anim_in", "none")
+    c.setdefault("anim_out", "none")
+    c.setdefault("anim_dur", 0.5)
+    return c
 
 
 def fix_project(p):
     base = new_project()
     base.update(p)
     for c in base["video"] + base["overlay"]:
-        c.setdefault("chroma", {"on": False, "color": "#00ff00", "tol": 0.3, "soft": 0.12})
-        c.setdefault("blend", "normal")
+        _clip_defaults(c)
+    for t in base["text"]:
+        t.setdefault("words", [])
+        t.setdefault("karaoke", False)
+        t.setdefault("hl_color", "#ffd60a")
+    base.setdefault("markers", [])
     return base
 
 
@@ -66,7 +87,10 @@ def video_clip(media):
             "filter": "none", "filter_amt": 1.0,
             "adj": {"bright": 0.0, "contrast": 0.0, "sat": 0.0, "temp": 0.0, "vignette": 0.0},
             "effect": "none", "trans": {"type": "none", "dur": 0.6},
-            "chroma": {"on": False, "color": "#00ff00", "tol": 0.3, "soft": 0.12}, "blend": "normal"}
+            "chroma": {"on": False, "color": "#00ff00", "tol": 0.3, "soft": 0.12}, "blend": "normal",
+            "kf": [], "crop": {"l": 0.0, "r": 0.0, "t": 0.0, "b": 0.0}, "radius": 0.0, "border_w": 0.0,
+            "border_color": "#ffffff", "anim_in": "none", "anim_out": "none", "anim_dur": 0.5,
+            } | {"adj": {"bright": 0.0, "contrast": 0.0, "sat": 0.0, "temp": 0.0, "vignette": 0.0, "blur": 0.0}}
 
 
 def overlay_clip(media, start):
@@ -125,6 +149,58 @@ def sticker_clip(start, emoji):
 
 def clip_len(c):
     return max(MIN_LEN, (c["out"] - c["in"]) / c.get("speed", 1.0))
+
+
+# ── Keyframes ───────────────────────────────────────────────────────────────
+KF_KEYS = ("x", "y", "scale", "rot", "opacity")
+KF_DEFAULTS = {"x": 0.0, "y": 0.0, "scale": 1.0, "rot": 0.0, "opacity": 1.0}
+
+
+def kf_values(c, local):
+    """Werte von Position/Größe/Drehung/Deckkraft zum Zeitpunkt `local` (Sekunden ab Clip-Start)."""
+    base = {k: c.get(k, KF_DEFAULTS[k]) for k in KF_KEYS}
+    kfs = c.get("kf") or []
+    if not kfs:
+        return base
+    if local <= kfs[0]["t"]:
+        return {k: kfs[0].get(k, base[k]) for k in KF_KEYS}
+    if local >= kfs[-1]["t"]:
+        return {k: kfs[-1].get(k, base[k]) for k in KF_KEYS}
+    for a, b in zip(kfs, kfs[1:]):
+        if a["t"] <= local <= b["t"]:
+            f = ease_io((local - a["t"]) / max(1e-6, b["t"] - a["t"]))
+            return {k: a.get(k, base[k]) + (b.get(k, base[k]) - a.get(k, base[k])) * f for k in KF_KEYS}
+    return base
+
+
+def kf_split(c, local):
+    """Keyframes beim Teilen an `local` aufteilen: (erste Hälfte, zweite Hälfte mit neuen Zeiten)."""
+    kfs = c.get("kf") or []
+    if not kfs:
+        return [], []
+    mid = {"t": 0.0, **kf_values(c, local)}
+    first = [dict(k) for k in kfs if k["t"] < local - 0.01] + [{**mid, "t": round(local, 3)}]
+    second = [{**mid}] + [{**k, "t": round(k["t"] - local, 3)} for k in kfs if k["t"] > local + 0.01]
+    return first, second
+
+
+def kf_at(c, local, tol=0.02):
+    for k in c.get("kf") or []:
+        if abs(k["t"] - local) <= tol:
+            return k
+    return None
+
+
+def kf_set(c, local, key=None, value=None):
+    """Keyframe an `local` anlegen (mit den aktuellen Werten) und optional einen Wert darin setzen."""
+    k = kf_at(c, local)
+    if k is None:
+        k = {"t": round(local, 3), **kf_values(c, local)}
+        c.setdefault("kf", []).append(k)
+        c["kf"].sort(key=lambda x: x["t"])
+    if key is not None:
+        k[key] = value
+    return k
 
 
 def layout(proj):
@@ -199,8 +275,45 @@ FILTERS = {
 EFFECTS = {
     "none": "Keiner", "zoom_in": "Zoom rein", "zoom_out": "Zoom raus", "shake": "Wackeln",
     "pulse": "Pulsieren", "rgb": "RGB-Split", "glitch": "Glitch", "flash": "Blitz",
-    "vhs": "Retro-VHS", "blur_in": "Unschärfe rein",
+    "vhs": "Retro-VHS", "blur_in": "Unschärfe rein", "float": "Schweben",
 }
+
+# Rein-/Raus-Animationen für Video- und Bild-Clips (Hauptspur und Overlay)
+CLIP_ANIMS = {"none": "Keine", "fade": "Einblenden", "pop": "Pop", "zoom": "Zoom",
+              "slide_l": "Von links", "slide_r": "Von rechts", "slide_u": "Von unten", "slide_d": "Von oben",
+              "spin": "Drehen"}
+
+
+def clip_anim(c, local, dur, W, H):
+    """(alpha, scale, dx, dy, rot) aus den Rein-/Raus-Animationen eines Clips."""
+    a, s, dx, dy, rot = 1.0, 1.0, 0.0, 0.0, 0.0
+    ad = max(0.05, min(c.get("anim_dur", 0.5), dur / 2))
+    for kind, p in ((c.get("anim_in", "none"), local / ad), (c.get("anim_out", "none"), (dur - local) / ad)):
+        if kind == "none" or p >= 1:
+            continue
+        p = max(0.0, p)
+        e = ease(p)
+        if kind == "fade":
+            a *= e
+        elif kind == "pop":
+            s *= 0.3 + 0.7 * back(p)
+            a *= min(1.0, p * 3)
+        elif kind == "zoom":
+            s *= 1.6 - 0.6 * e
+            a *= e
+        elif kind == "slide_l":
+            dx -= (1 - e) * W
+        elif kind == "slide_r":
+            dx += (1 - e) * W
+        elif kind == "slide_u":
+            dy += (1 - e) * H
+        elif kind == "slide_d":
+            dy -= (1 - e) * H
+        elif kind == "spin":
+            rot -= (1 - e) * 180
+            s *= 0.2 + 0.8 * e
+            a *= e
+    return a, s, dx, dy, rot
 
 TRANSITIONS = {
     "none": "Keiner", "fade": "Überblenden", "black": "Schwarzblende", "white": "Weißblende",
@@ -333,6 +446,8 @@ def effect_transform(c, local, dur, W, H):
                 (math.sin(local * 31) * 0.6 + math.cos(local * 19.7) * 0.4) * H * 0.01)
     if eff == "pulse":
         return 1 + 0.045 * (0.5 + 0.5 * math.sin(local * math.tau * 2)) ** 2, 0, 0
+    if eff == "float":
+        return 1.0, math.sin(local * 1.3) * W * 0.006, math.sin(local * 2.1) * H * 0.018
     return 1.0, 0, 0
 
 
@@ -1003,6 +1118,43 @@ def draw_text(p: QPainter, tc, t, W, H, rects=None, force=False):
         p.strokePath(path, QPen(QColor(tc.get("stroke", "#000000")), sw * 2 * k, Qt.SolidLine,
                                 Qt.RoundCap, Qt.RoundJoin))
     p.fillPath(path, QColor(tc.get("color", "#ffffff")))
+    # Karaoke: das aktuell gesprochene Wort hervorheben
+    if tc.get("karaoke") and not force:
+        tokens = [(i, tok) for i, line in enumerate(text_lines) for tok in line.split(" ") if tok]
+        words = tc.get("words") or []
+        if tokens and len(tokens) != len(words):            # kein Sprach-Timing → gleichmäßig verteilen
+            d = max(0.05, dur * 0.9 / len(tokens))
+            words = [(i * d, (i + 1) * d, tok) for i, (_, tok) in enumerate(tokens)]
+        if tokens:
+            active = -1
+            for j, (ws, we, _) in enumerate(words):
+                if ws <= local + 0.02:
+                    active = j
+            if active >= 0:
+                hl = QPainterPath()
+                j = 0
+                for i, line in enumerate(text_lines):
+                    x = -fm.horizontalAdvance(line) / 2
+                    base_y = i * lh + fm.ascent() + (lh - fm.height()) / 2 - total / 2
+                    for tok in line.split(" "):
+                        if tok:
+                            if j == active:
+                                hl.addText(x, base_y, font, tok)
+                            j += 1
+                        x += fm.horizontalAdvance(tok + " ")
+                if not hl.isEmpty():
+                    ws = words[active][0]
+                    pop = 1 + 0.12 * max(0.0, 1 - (local - ws) / 0.18)
+                    cc = hl.boundingRect().center()
+                    p.save()
+                    p.translate(cc)
+                    p.scale(pop, pop)
+                    p.translate(-cc)
+                    if sw > 0:
+                        p.strokePath(hl, QPen(QColor(tc.get("stroke", "#000000")), sw * 2 * k, Qt.SolidLine,
+                                              Qt.RoundCap, Qt.RoundJoin))
+                    p.fillPath(hl, QColor(tc.get("hl_color", "#ffd60a")))
+                    p.restore()
     p.restore()
 
 
@@ -1126,7 +1278,9 @@ class Renderer:
             return
         local = t - start
         dur = end - start
-        a = alpha * c.get("opacity", 1.0)
+        kv = kf_values(c, local)
+        aa, asc, adx, ady, arot = clip_anim(c, local, dur, W, H)
+        a = alpha * kv["opacity"] * aa
         if c.get("fade_in", 0) > 0:
             a *= max(0.0, min(1.0, local / c["fade_in"]))
         if c.get("fade_out", 0) > 0:
@@ -1135,18 +1289,30 @@ class Renderer:
             return
         src = c["in"] + local * c.get("speed", 1.0)
         mw, mh = max(1, media["w"]), max(1, media["h"])
+        cr = c.get("crop") or {}
+        cl, crr, ct, cb = (max(0.0, min(0.45, float(cr.get(k, 0.0)))) for k in ("l", "r", "t", "b"))
+        fx_, fy_ = max(0.1, 1 - cl - crr), max(0.1, 1 - ct - cb)
+        vw, vh = mw * fx_, mh * fy_                      # sichtbarer (zugeschnittener) Bereich
         es, edx, edy = effect_transform(c, local, dur, W, H)
-        s0 = min(W / mw, H / mh)
-        sc = c.get("scale", 1.0) * es * scale
-        disp_w, disp_h = mw * s0 * sc, mh * s0 * sc
-        dw = _even(min(mw, max(2, disp_w)))
-        dh = _even(min(mh, max(2, disp_h)))
+        s0 = min(W / vw, H / vh)
+        sc = kv["scale"] * es * scale * asc
+        disp_w, disp_h = vw * s0 * sc, vh * s0 * sc
+        dw = _even(min(mw, max(2, disp_w / fx_)))
+        dh = _even(min(mh, max(2, disp_h / fy_)))
+        bf = 1.0
         if c.get("effect") == "blur_in":
-            bf = max(1.0, 18 * (1 - ease(local / 0.8)))
+            bf = max(bf, 18 * (1 - ease(local / 0.8)))
+        blur = c.get("adj", {}).get("blur", 0) or 0
+        if blur > 0:
+            bf = max(bf, 1 + blur * 22)
+        if bf > 1:
             dw, dh = _even(max(2, dw / bf)), _even(max(2, dh / bf))
         arr = self._frame(media, c["id"], src, dw, dh)
         if arr is None:
             return
+        if cl or crr or ct or cb:
+            h_, w_ = arr.shape[:2]
+            arr = arr[int(h_ * ct):(h_ - int(h_ * cb)) or h_, int(w_ * cl):(w_ - int(w_ * crr)) or w_]
         arr = frame_effect(apply_color(arr, c), c, local)
         ck = c.get("chroma") or {}
         qimg = rgb_to_qimage(chroma_key(arr, ck) if ck.get("on") else arr)
@@ -1166,16 +1332,29 @@ class Renderer:
                 p.fillRect(QRectF(dx, dy, W, H), QColor(proj.get("bg_color", "#000000")))
             else:
                 p.fillRect(QRectF(dx, dy, W, H), QColor(0, 0, 0))
-        cx = W / 2 + c.get("x", 0) * W + dx + edx
-        cy = H / 2 + c.get("y", 0) * H + dy + edy
+        cx = W / 2 + kv["x"] * W + dx + edx + adx
+        cy = H / 2 + kv["y"] * H + dy + edy + ady
         p.translate(cx, cy)
-        p.rotate(c.get("rot", 0) + rot)
+        p.rotate(kv["rot"] + rot + arot)
         if c.get("flip"):
             p.scale(-1, 1)
+        target = QRectF(-disp_w / 2, -disp_h / 2, disp_w, disp_h)
+        rad = (c.get("radius", 0) or 0) * min(disp_w, disp_h)
+        if rad > 0.5:
+            rpath = QPainterPath()
+            rpath.addRoundedRect(target, rad, rad)
+            p.setClipPath(rpath, Qt.IntersectClip)
         mode = BLENDS.get(c.get("blend", "normal"), BLENDS["normal"])[1]
         p.setCompositionMode(mode)
-        p.drawImage(QRectF(-disp_w / 2, -disp_h / 2, disp_w, disp_h), qimg)
+        p.drawImage(target, qimg)
         p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        bw = (c.get("border_w", 0) or 0) * H / 1080
+        if bw > 0:
+            inner = target.adjusted(bw / 2, bw / 2, -bw / 2, -bw / 2)
+            p.setPen(QPen(QColor(c.get("border_color", "#ffffff")), bw))
+            p.setBrush(Qt.NoBrush)
+            r_in = max(0.0, rad - bw / 2)
+            p.drawRoundedRect(inner, r_in, r_in)
         p.resetTransform()
         self.rects[c["id"]] = QRectF(cx - disp_w / 2, cy - disp_h / 2, disp_w, disp_h)
         vig = c.get("adj", {}).get("vignette", 0)
@@ -1373,11 +1552,12 @@ def download_model(root, size, progress=None, cancel=lambda: False):
 
 
 def caption_lines(segs, max_chars=32, max_dur=3.0):
+    """Gruppiert Wörter zu Untertitel-Zeilen: (start, ende, text, [(wort_start, wort_ende, wort), …])."""
     lines = []
     for s, e, text, words in segs:
         if not words:
             if text:
-                lines.append([s, e, text])
+                lines.append([s, e, text, []])
             continue
         cur, cs = [], None
         for ws, we, w in words:
@@ -1388,11 +1568,11 @@ def caption_lines(segs, max_chars=32, max_dur=3.0):
                 cs = ws
             cand = " ".join([x[2] for x in cur] + [w])
             if cur and (len(cand) > max_chars or we - cs > max_dur or cur[-1][2][-1:] in ".!?"):
-                lines.append([cs, cur[-1][1], " ".join(x[2] for x in cur)])
+                lines.append([cs, cur[-1][1], " ".join(x[2] for x in cur), cur])
                 cur, cs = [], ws
             cur.append((ws, we, w))
         if cur:
-            lines.append([cs, cur[-1][1], " ".join(x[2] for x in cur)])
+            lines.append([cs, cur[-1][1], " ".join(x[2] for x in cur), cur])
     for i in range(len(lines) - 1):
         if 0 < lines[i + 1][0] - lines[i][1] < 0.35:
             lines[i][1] = lines[i + 1][0]
@@ -1439,8 +1619,9 @@ class CaptionJob(QThread):
                                 [(w.start, w.end, w.word) for w in (s.words or [])]))
                     self.status.emit(f"Erkenne Sprache … „{s.text.strip()[:40]}“",
                                      0.3 + 0.7 * min(1.0, (done + s.end) / total))
-                for s, e, text in caption_lines(raw):
-                    result.append((tl_start + s / speed, tl_start + e / speed, text))
+                for s, e, text, words in caption_lines(raw):
+                    rel = [((ws - s) / speed, (we - s) / speed, w) for ws, we, w in words]
+                    result.append((tl_start + s / speed, tl_start + e / speed, text, rel))
                 done += b - a
             if self.cancel:
                 self.finished_ok.emit(False, "Abgebrochen", [])
@@ -1544,3 +1725,114 @@ class ExportJob(QThread):
             out.close()
             rend.close()
         return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Beat-Erkennung, Sprachausgabe, Ton-Export
+# ════════════════════════════════════════════════════════════════════════════
+def detect_beats(path, t0, t1, rate=11025):
+    """Findet Schläge (Kick/Snare-Einsätze) per spektralem Fluss. Zeiten relativ zu t0."""
+    x = decode_range(path, t0, t1, rate=rate)
+    if len(x) < rate:
+        return []
+    n_fft, hop = 1024, 256
+    win = np.hanning(n_fft).astype(np.float32)
+    frames = np.lib.stride_tricks.sliding_window_view(np.pad(x, (n_fft // 2, n_fft)), n_fft)[::hop]
+    mag = np.log1p(np.abs(np.fft.rfft(frames * win, axis=1))[:, :int(4000 / rate * n_fft)] * 10)
+    flux = np.concatenate([[0.0], np.maximum(0, np.diff(mag, axis=0)).sum(axis=1)])
+    k = max(1, int(0.5 * rate / hop))
+    local_mean = np.convolve(np.pad(flux, (k, k), mode="reflect"), np.ones(2 * k + 1) / (2 * k + 1), mode="valid")
+    thr = np.maximum(local_mean * 1.5, np.median(flux) * 1.5) + flux.std() * 0.2
+    beats, min_gap, last = [], int(0.28 * rate / hop), -10 ** 9
+    for i in range(1, len(flux) - 1):
+        if flux[i] > thr[i] and flux[i] >= flux[i - 1] and flux[i] >= flux[i + 1] and i - last >= min_gap:
+            beats.append(round(i * hop / rate + 0.02, 3))
+            last = i
+    return beats
+
+
+_NO_WINDOW = 0x08000000
+
+
+def _ps(cmd, timeout=120):
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                          capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
+
+
+def tts_voices():
+    """Installierte Windows-Stimmen: [(Name, Sprache), …]."""
+    try:
+        r = _ps("Add-Type -AssemblyName System.Speech; "
+                "(New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices() | "
+                "Where-Object Enabled | ForEach-Object { $_.VoiceInfo.Name + '|' + $_.VoiceInfo.Culture.Name }", 30)
+        return [tuple(l.strip().split("|", 1)) for l in r.stdout.splitlines() if "|" in l]
+    except Exception:
+        return []
+
+
+def tts_to_wav(text, out_path, voice=None, rate=0):
+    """Text mit einer Windows-Stimme vorlesen lassen und als WAV speichern."""
+    out_path = Path(out_path)
+    txt = out_path.with_suffix(".txt")
+    txt.write_text(text, encoding="utf-8")
+    q = lambda s: str(s).replace("'", "''")
+    cmd = ("Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+           + (f"$s.SelectVoice('{q(voice)}'); " if voice else "")
+           + f"$s.Rate = {int(rate)}; $s.SetOutputToWaveFile('{q(out_path)}'); "
+           + f"$s.Speak([IO.File]::ReadAllText('{q(txt)}', [Text.Encoding]::UTF8)); $s.Dispose()")
+    try:
+        r = _ps(cmd)
+    finally:
+        txt.unlink(missing_ok=True)
+    if not out_path.exists() or out_path.stat().st_size < 100:
+        raise RuntimeError((r.stderr or "Sprachausgabe fehlgeschlagen").strip()[:200])
+    return out_path
+
+
+class AudioExportJob(QThread):
+    """Exportiert nur den Ton des Projekts als MP3 oder WAV."""
+    progress = Signal(float)
+    finished_ok = Signal(bool, str)
+
+    def __init__(self, proj, store, path):
+        super().__init__()
+        self.proj, self.store, self.path = copy.deepcopy(proj), store, str(path)
+        self.cancel = False
+
+    def run(self):
+        try:
+            mp3 = self.path.lower().endswith(".mp3")
+            out = av.open(self.path, "w")
+            try:
+                st = out.add_stream("libmp3lame" if mp3 else "pcm_s16le", rate=SR)
+                try:
+                    st.layout = "stereo"
+                except Exception:
+                    pass
+                if mp3:
+                    st.bit_rate = 256000
+                total = max(0.1, duration(self.proj))
+                n_total, pos, step = int(total * SR), 0, 4096
+                while pos < n_total and not self.cancel:
+                    n = min(step, n_total - pos)
+                    chunk = mix_audio(self.proj, self.store, pos / SR, n, block=True)
+                    fr = av.AudioFrame.from_ndarray(np.ascontiguousarray(chunk.T), format="fltp", layout="stereo")
+                    fr.sample_rate = SR
+                    fr.pts = pos
+                    fr.time_base = Fraction(1, SR)
+                    for pkt in st.encode(fr):
+                        out.mux(pkt)
+                    pos += n
+                    self.progress.emit(pos / n_total)
+                for pkt in st.encode(None):
+                    out.mux(pkt)
+            finally:
+                out.close()
+            if self.cancel:
+                Path(self.path).unlink(missing_ok=True)
+                self.finished_ok.emit(False, "Abgebrochen")
+            else:
+                self.finished_ok.emit(True, self.path)
+        except Exception as e:
+            Path(self.path).unlink(missing_ok=True)
+            self.finished_ok.emit(False, str(e))

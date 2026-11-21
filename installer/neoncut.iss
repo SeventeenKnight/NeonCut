@@ -63,3 +63,16 @@ Root: HKA; Subkey: "Software\Classes\NeonCut.Project\shell\open\command"; ValueT
 
 [Run]
 Filename: "{app}\NeonCut.exe"; Description: "{cm:LaunchProgram,NeonCut}"; Flags: nowait postinstall skipifsilent
+; Nach einem stillen Auto-Update NeonCut wieder öffnen – außer das Update lief beim Schließen (/NOLAUNCH)
+Filename: "{app}\NeonCut.exe"; Parameters: "--updated"; Flags: nowait skipifnotsilent; Check: not HasParam('/NOLAUNCH')
+
+[Code]
+function HasParam(const Value: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), Value) = 0 then
+      Result := True;
+end;

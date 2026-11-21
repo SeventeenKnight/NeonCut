@@ -33,6 +33,16 @@
 - 🎬 **Export bis 4K / 60 fps, ohne Wasserzeichen** – auf Wunsch über die NVIDIA-Grafikkarte
 - Formate 16:9, 9:16 (TikTok/Reels/Shorts), 1:1, 4:5, 21:9 mit unscharfem Hintergrund
 
+**Neu in 1.2**
+- 🔑 **Keyframes** für Größe, Position, Drehung und Deckkraft – Zoom-Fahrten und Bewegungen (`K`)
+- 🎞️ **Animationen für Bilder & Videos** – rein/raus: Einblenden, Pop, Zoom, Reinfliegen, Drehen; Dauer-Effekt „Schweben“
+- 🎤 **Karaoke-Untertitel** – das gesprochene Wort leuchtet Wort für Wort auf
+- 🗣️ **Text vorlesen lassen** mit den Windows-Stimmen – landet als Tonspur in der Timeline
+- ✂️ **Zuschneiden**, **abgerundete Ecken** und **Rahmen** für Clips und Bild-in-Bild, **Unschärfe**-Regler
+- 🥁 **Marker & Beat-Erkennung** – Musik-Beats markieren und Videos im Takt schneiden (`M`)
+- 🔊 **Lautstärke angleichen** mit einem Klick, **nur den Ton exportieren** (MP3 / WAV)
+- 🔄 **Automatische Updates** über GitHub – installiert sich beim Schließen oder per Klick
+
 <p align="center">
   <img src="docs/screenshot-sticker.png" width="49%" alt="Sticker">
   <img src="docs/screenshot-filter.png" width="49%" alt="Filter">

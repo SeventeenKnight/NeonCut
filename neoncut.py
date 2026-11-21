@@ -11,14 +11,19 @@ import ctypes
 import json
 import math
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import (QColor, QDrag, QFont, QFontDatabase, QFontMetrics, QLinearGradient, QPainter,
-                           QPainterPath, QPen, QPixmap, QPolygonF)
+from PySide6.QtCore import QEvent, QMimeData, QObject, QPointF, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (QColor, QDesktopServices, QDrag, QFont, QFontDatabase, QFontMetrics, QLinearGradient,
+                           QPainter, QPainterPath, QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
                                QLineEdit, QMainWindow, QPlainTextEdit, QProgressBar, QPushButton,
                                QScrollArea, QScrollBar, QSlider, QSplitter, QStackedWidget, QVBoxLayout,
@@ -31,8 +36,12 @@ from ui_kit import (C_ACCENT, C_AUDIO, C_BG, C_BORDER, C_BORDER2, C_MUTED, C_SID
                     icon_button, label, make_anim, make_arrow_png, mix, row, run_anim, styled_menu)
 
 APP_NAME = "NeonCut"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+FROZEN = getattr(sys, "frozen", False)
+GITHUB_REPO = "SeventeenKnight/NeonCut"
+UPDATE_DIR = Path(tempfile.gettempdir()) / "NeonCut-Update"
 DATA = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
+TTS_DIR = DATA / "sprache"
 AUTOSAVE = DATA / "autosave.neoncut"
 SETTINGS = DATA / "settings.json"
 MODELS = DATA / "models"
@@ -584,7 +593,8 @@ class Preview(QWidget):
         if hit:
             self.app.select(*hit)
             kind, c = E.find_clip(self.app.proj, hit[1])
-            self.drag = {"id": hit[1], "start": e.position(), "x": c["x"], "y": c["y"], "moved": False}
+            self.drag = {"id": hit[1], "start": e.position(), "x": self.app.visual_value(c, "x"),
+                         "y": self.app.visual_value(c, "y"), "moved": False}
         else:
             self.app.select(None)
 
@@ -609,7 +619,8 @@ class Preview(QWidget):
     def _set_pos(self, cid, x, y):
         _, c = E.find_clip(self.app.proj, cid)
         if c:
-            c["x"], c["y"] = round(x, 4), round(y, 4)
+            self.app.set_visual(c, "x", round(x, 4))
+            self.app.set_visual(c, "y", round(y, 4))
 
     def mouseReleaseEvent(self, e):
         if self.drag and self.drag["moved"]:
@@ -625,7 +636,8 @@ class Preview(QWidget):
         if kind == "text":
             self.app.modify("size:" + c["id"], lambda: c.__setitem__("size", max(12, min(600, c["size"] * f))))
         elif kind in ("video", "overlay"):
-            self.app.modify("scale:" + c["id"], lambda: c.__setitem__("scale", max(0.05, min(5, c["scale"] * f))))
+            sc = self.app.visual_value(c, "scale")
+            self.app.modify("scale:" + c["id"], lambda: self.app.set_visual(c, "scale", max(0.05, min(5, sc * f))))
         self.app.refresh_inspector_values()
 
     def paintEvent(self, e):
@@ -842,6 +854,7 @@ class Timeline(QWidget):
             for c in proj[kind]:
                 if c["id"] != exclude:
                     cands += list(E.span(proj, kind, c))
+        cands += proj.get("markers", [])
         best, bd = t, 9.0
         for ct in cands:
             d = abs(ct - t) * self.pps
@@ -1175,6 +1188,17 @@ class Timeline(QWidget):
             t += minor
             n += 1
         p.fillRect(QRectF(0, self.RULER - 1, W, 1), QColor(C_BORDER))
+        # Marker (M) – gelbe Fähnchen im Lineal, feine Linie durch die Spuren
+        for mt in self.app.proj.get("markers", []):
+            x = self.tx(mt)
+            if -10 < x < W + 10:
+                p.setPen(QPen(QColor(255, 214, 10, 60), 1))
+                p.drawLine(QPointF(x, self.RULER), QPointF(x, self.height()))
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor("#ffd60a"))
+                p.drawPolygon(QPolygonF([QPointF(x - 5, self.RULER - 12), QPointF(x + 5, self.RULER - 12),
+                                         QPointF(x + 5, self.RULER - 5), QPointF(x, self.RULER - 1),
+                                         QPointF(x - 5, self.RULER - 5)]))
 
     def _clip(self, p, kind, c, r, selected):
         proj = self.app.proj
@@ -1259,6 +1283,18 @@ class Timeline(QWidget):
             p.drawText(QRectF(rr.left() + 8, rr.top() + 1, rr.width() - 14, 15), Qt.AlignLeft | Qt.AlignVCenter,
                        QFontMetrics(f_lbl).elidedText(name, Qt.ElideRight, int(max(0, rr.width() - 14))))
         p.restore()
+        if kind in ("video", "overlay") and c.get("kf"):
+            ky = rr.bottom() - 7
+            for kf in c["kf"]:
+                kx = rr.left() + kf["t"] * self.pps
+                if rr.left() - 1 <= kx <= rr.right() + 1:
+                    p.save()
+                    p.translate(kx, ky)
+                    p.rotate(45)
+                    p.setPen(QPen(QColor("#111111"), 1))
+                    p.setBrush(QColor("#ffd60a"))
+                    p.drawRect(QRectF(-3.5, -3.5, 7, 7))
+                    p.restore()
         if selected:
             p.setPen(QPen(QColor("#ffffff"), 2))
             p.setBrush(Qt.NoBrush)
@@ -1342,8 +1378,9 @@ class TrackHeaders(QWidget):
 #  Eigenschaften
 # ════════════════════════════════════════════════════════════════════════════
 class Inspector(QWidget):
-    TABS = {"video": ["Basis", "Bild", "Farbe", "Audio"], "image": ["Basis", "Bild", "Farbe"],
-            "overlay": ["Basis", "Bild", "Overlay", "Farbe"], "overlay_img": ["Basis", "Bild", "Overlay", "Farbe"],
+    TABS = {"video": ["Basis", "Bild", "Anim.", "Farbe", "Audio"], "image": ["Basis", "Bild", "Anim.", "Farbe"],
+            "overlay": ["Basis", "Bild", "Anim.", "Overlay", "Farbe"],
+            "overlay_img": ["Basis", "Bild", "Anim.", "Overlay", "Farbe"],
             "text": ["Text", "Stil", "Animation"], "sticker": ["Sticker"], "audio": ["Audio"]}
     TITLES = {"video": "Video-Clip", "image": "Bild-Clip", "overlay": "Overlay", "overlay_img": "Overlay-Bild",
               "text": "Text", "sticker": "Sticker", "audio": "Audio"}
@@ -1351,7 +1388,7 @@ class Inspector(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.setFixedWidth(330)
+        self.setFixedWidth(344)
         self.v = QVBoxLayout(self)
         self.v.setContentsMargins(16, 16, 16, 12)
         self.v.setSpacing(10)
@@ -1404,7 +1441,7 @@ class Inspector(QWidget):
             self.tabs_holder.addWidget(self.tabs)
         builder = {"Basis": self._basis, "Bild": self._bild, "Farbe": self._farbe, "Audio": self._audio,
                    "Text": self._text, "Stil": self._stil, "Animation": self._anim, "Overlay": self._overlay,
-                   "Sticker": self._sticker}[tabs[idx]]
+                   "Sticker": self._sticker, "Anim.": self._clip_anim}[tabs[idx]]
         self._set_content(builder(c))
 
     def _set_content(self, w):
@@ -1531,14 +1568,8 @@ class Inspector(QWidget):
         else:
             self._slider(lay, "speed", "Geschwindigkeit", lambda: c["speed"],
                          lambda v: c.__setitem__("speed", max(0.1, v)), 0.1, 4.0, 1.0, "{:.2f}", 100, "x")
-        self._slider(lay, "opacity", "Deckkraft", lambda: c["opacity"],
-                     lambda v: c.__setitem__("opacity", v), 0, 1, 1.0, "{:.0%}", 100)
-        self._slider(lay, "fade_in", "Einblenden", lambda: c["fade_in"],
-                     lambda v: c.__setitem__("fade_in", v), 0, 3, 0, "{:.1f}", 10, " s")
-        self._slider(lay, "fade_out", "Ausblenden", lambda: c["fade_out"],
-                     lambda v: c.__setitem__("fade_out", v), 0, 3, 0, "{:.1f}", 10, " s")
-        self._combo(lay, "Effekt", list(E.EFFECTS.items()), lambda: c.get("effect", "none"),
-                    lambda v: c.__setitem__("effect", v), "effect")
+        self._slider(lay, "opacity", "Deckkraft", lambda: self.app.visual_value(c, "opacity"),
+                     lambda v: self.app.set_visual(c, "opacity", v), 0, 1, 1.0, "{:.0%}", 100)
         if self.kind in ("video", "image"):
             self._combo(lay, "Übergang zum nächsten Clip", list(E.TRANSITIONS.items()),
                         lambda: c["trans"]["type"], lambda v: c["trans"].__setitem__("type", v), "trans")
@@ -1546,14 +1577,54 @@ class Inspector(QWidget):
                          lambda v: c["trans"].__setitem__("dur", v), 0.1, 2.0, 0.6, "{:.1f}", 10, " s")
         return w
 
+    def _keyframe_box(self, lay, c):
+        kl = lay
+        kl.addWidget(label("KEYFRAMES", "section"))
+        n = len(c.get("kf") or [])
+        at = E.kf_at(c, self.app.clip_local(c)) is not None
+        txt = (f"{n} Keyframe{'s' if n != 1 else ''}" + ("  ·  einer liegt am weißen Strich" if at else "")) if n else \
+            "Noch keine – die Werte gelten für den ganzen Clip."
+        info = label(txt, "muted")
+        info.setWordWrap(True)
+        kl.addWidget(info)
+        hb = QHBoxLayout()
+        hb.setSpacing(4)
+        b = QPushButton("  Keyframe entfernen" if at else "  Keyframe setzen")
+        b.setIcon(icon("trash" if at else "plus"))
+        b.setCursor(Qt.PointingHandCursor)
+        b.setToolTip("Taste K")
+        b.clicked.connect(lambda: self.app.toggle_keyframe(c))
+        hb.addWidget(b, 1)
+        hb.addWidget(icon_button("start", "Zum vorherigen Keyframe", lambda: self.app.jump_keyframe(c, -1)))
+        hb.addWidget(icon_button("end", "Zum nächsten Keyframe", lambda: self.app.jump_keyframe(c, 1)))
+        kl.addLayout(hb)
+        if n:
+            clr = QPushButton("Alle Keyframes löschen")
+            clr.setObjectName("ghost")
+            clr.clicked.connect(lambda: self.app.clear_keyframes(c))
+            kl.addWidget(clr)
+        tip = label("Sobald es Keyframes gibt, speichert jede Änderung an Größe, Position, Drehung und Deckkraft "
+                    "den Wert am weißen Strich – so entstehen Zoom-Fahrten und Bewegungen.", "muted")
+        tip.setWordWrap(True)
+        kl.addWidget(tip)
+        line = QWidget()
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background: {C_BORDER};")
+        kl.addWidget(line)
+
     def _bild(self, c):
         w, lay = self._page()
-        self._slider(lay, "scale", "Skalierung", lambda: c["scale"],
-                     lambda v: c.__setitem__("scale", v), 0.05, 4, 1.0, "{:.0%}", 100)
-        self._slider(lay, "x", "Position X", lambda: c["x"], lambda v: c.__setitem__("x", v), -1, 1, 0, "{:+.0%}", 100)
-        self._slider(lay, "y", "Position Y", lambda: c["y"], lambda v: c.__setitem__("y", v), -1, 1, 0, "{:+.0%}", 100)
-        self._slider(lay, "rot", "Drehung", lambda: c["rot"], lambda v: c.__setitem__("rot", v), -180, 180, 0,
-                     "{:.0f}", 1, "°")
+        self._keyframe_box(lay, c)
+
+        def vis(key):
+            return lambda: self.app.visual_value(c, key)
+
+        def setv(key):
+            return lambda v: self.app.set_visual(c, key, v)
+        self._slider(lay, "scale", "Skalierung", vis("scale"), setv("scale"), 0.05, 4, 1.0, "{:.0%}", 100)
+        self._slider(lay, "x", "Position X", vis("x"), setv("x"), -1, 1, 0, "{:+.0%}", 100)
+        self._slider(lay, "y", "Position Y", vis("y"), setv("y"), -1, 1, 0, "{:+.0%}", 100)
+        self._slider(lay, "rot", "Drehung", vis("rot"), setv("rot"), -180, 180, 0, "{:.0f}", 1, "°")
         self._toggle_row(lay, "Spiegeln", "Horizontal spiegeln", lambda: c.get("flip", False),
                          lambda on: c.__setitem__("flip", on), "flip")
         h = QHBoxLayout()
@@ -1563,7 +1634,46 @@ class Inspector(QWidget):
             b.clicked.connect(lambda _=False, sc=sc: self.app.fit_clip(c["id"], sc))
             h.addWidget(b)
         lay.addLayout(h)
-        lay.addWidget(label("Tipp: In der Vorschau ziehen = verschieben, Strg + Mausrad = Größe.", "muted"))
+        lay.addWidget(label("ZUSCHNEIDEN", "section"))
+        cr = c.setdefault("crop", {"l": 0.0, "r": 0.0, "t": 0.0, "b": 0.0})
+        for key, title in (("l", "Links"), ("r", "Rechts"), ("t", "Oben"), ("b", "Unten")):
+            self._slider(lay, "crop_" + key, title, lambda k=key: cr.get(k, 0.0),
+                         lambda v, k=key: cr.__setitem__(k, v), 0, 0.45, 0, "{:.0%}", 100)
+        lay.addWidget(label("ECKEN & RAHMEN", "section"))
+        self._slider(lay, "radius", "Ecken abrunden", lambda: c.get("radius", 0.0),
+                     lambda v: c.__setitem__("radius", v), 0, 0.5, 0, "{:.0%}", 100)
+        self._slider(lay, "border_w", "Rahmenstärke", lambda: c.get("border_w", 0.0),
+                     lambda v: c.__setitem__("border_w", v), 0, 30, 0, "{:.0f}", 1)
+        self._swatch(lay, "Rahmenfarbe", lambda: c.get("border_color", "#ffffff"),
+                     lambda v: c.__setitem__("border_color", v or "#ffffff"), "border_color")
+        tip = label("Tipp: In der Vorschau ziehen = verschieben, Strg + Mausrad = Größe.", "muted")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        return w
+
+    def _clip_anim(self, c):
+        w, lay = self._page()
+        intro = label("Wie das Bild bzw. Video erscheint und verschwindet. Für eigene Bewegungen: "
+                      "Keyframes im Tab „Bild“.", "muted")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        self._combo(lay, "Animation rein", list(E.CLIP_ANIMS.items()), lambda: c.get("anim_in", "none"),
+                    lambda v: c.__setitem__("anim_in", v), "anim_in")
+        self._combo(lay, "Animation raus", list(E.CLIP_ANIMS.items()), lambda: c.get("anim_out", "none"),
+                    lambda v: c.__setitem__("anim_out", v), "anim_out")
+        self._slider(lay, "anim_dur", "Dauer der Animation", lambda: c.get("anim_dur", 0.5),
+                     lambda v: c.__setitem__("anim_dur", v), 0.1, 3.0, 0.5, "{:.1f}", 10, " s")
+        self._slider(lay, "fade_in", "Einblenden", lambda: c["fade_in"],
+                     lambda v: c.__setitem__("fade_in", v), 0, 3, 0, "{:.1f}", 10, " s")
+        self._slider(lay, "fade_out", "Ausblenden", lambda: c["fade_out"],
+                     lambda v: c.__setitem__("fade_out", v), 0, 3, 0, "{:.1f}", 10, " s")
+        self._combo(lay, "Dauer-Effekt", list(E.EFFECTS.items()), lambda: c.get("effect", "none"),
+                    lambda v: c.__setitem__("effect", v), "effect")
+        b = QPushButton("  Vorschau abspielen")
+        b.setIcon(icon("play"))
+        b.setCursor(Qt.PointingHandCursor)
+        b.clicked.connect(lambda: self.app.preview_clip(c))
+        lay.addWidget(b)
         return w
 
     def _overlay(self, c):
@@ -1602,8 +1712,10 @@ class Inspector(QWidget):
                          -1, 1, 0, "{:+.0f}", 100)
         self._slider(lay, "adj_vignette", "Vignette", lambda: adj["vignette"],
                      lambda v: adj.__setitem__("vignette", v), 0, 1, 0, "{:.0f}", 100)
+        self._slider(lay, "adj_blur", "Unschärfe", lambda: adj.get("blur", 0.0),
+                     lambda v: adj.__setitem__("blur", v), 0, 1, 0, "{:.0f}", 100)
         self._button(lay, "Farbe zurücksetzen", None, lambda: (self.app.modify("reset_color", lambda: (
-            adj.update(bright=0.0, contrast=0.0, sat=0.0, temp=0.0, vignette=0.0),
+            adj.update(bright=0.0, contrast=0.0, sat=0.0, temp=0.0, vignette=0.0, blur=0.0),
             c.update(filter="none", filter_amt=1.0))), self.rebuild()))
         return w
 
@@ -1614,8 +1726,10 @@ class Inspector(QWidget):
                          lambda v: c.__setitem__("volume", v), 0, 3, 1.0, "{:.0%}", 100)
         else:
             self._volume(lay, c)
+        self._button(lay, "Lautstärke angleichen", "volume", lambda: self.app.normalize(c))
         self._toggle_row(lay, "Rauschen entfernen", "Brummen, Wind und Hintergrundrauschen herausfiltern",
                          lambda: c.get("denoise", False), lambda on: c.__setitem__("denoise", on), "denoise")
+        self._button(lay, "Beats markieren", "sparkle", lambda: self.app.mark_beats(c))
         if self.kind == "audio":
             self._slider(lay, "fade_in", "Einblenden", lambda: c["fade_in"],
                          lambda v: c.__setitem__("fade_in", v), 0, 5, 0, "{:.1f}", 10, " s")
@@ -1651,6 +1765,19 @@ class Inspector(QWidget):
                      "{:+.0%}", 100)
         self._slider(lay, "tdur", "Dauer", lambda: c["dur"], lambda v: c.__setitem__("dur", v), 0.3, 30, 3,
                      "{:.1f}", 10, " s")
+        lay.addWidget(label("KARAOKE", "section"))
+        self._toggle_row(lay, "Wort für Wort hervorheben", "Das gesprochene Wort leuchtet auf (bei Auto-Untertiteln "
+                         "exakt zur Sprache, sonst gleichmäßig verteilt)", lambda: c.get("karaoke", False),
+                         lambda on: self.app.set_karaoke(c, on), "karaoke")
+        self._swatch(lay, "Farbe des aktuellen Worts", lambda: c.get("hl_color", "#ffd60a"),
+                     lambda v: c.__setitem__("hl_color", v or "#ffd60a"), "hl_color")
+        lay.addWidget(label("VORLESEN", "section"))
+        voices = self.app.voices or [("", "Windows-Standardstimme")]
+        cur = self.app.settings.get("tts_voice") or next((v for v, l in voices if str(l).startswith("de")), voices[0][0])
+        vcb = combo([(v, f"{v.replace('Microsoft ', '').replace(' Desktop', '')}  ·  {l}" if v else l)
+                     for v, l in voices], cur, lambda v: self.app.settings.__setitem__("tts_voice", v))
+        lay.addWidget(vcb)
+        self._button(lay, "Text vorlesen lassen", "volume", lambda: self.app.text_to_speech(c, vcb.currentData()))
         if c.get("auto"):
             self._button(lay, "Stil auf alle Untertitel übertragen", "cc", lambda: self.app.caption_style_to_all(c))
         return w
@@ -1873,8 +2000,8 @@ class CaptionDialog(DialogBase):
     LANGS = [("auto", "Automatisch erkennen"), ("de", "Deutsch"), ("en", "Englisch"), ("es", "Spanisch"),
              ("fr", "Französisch"), ("it", "Italienisch"), ("tr", "Türkisch"), ("pl", "Polnisch"),
              ("pt", "Portugiesisch"), ("nl", "Niederländisch"), ("ru", "Russisch"), ("ar", "Arabisch")]
-    STYLES = [("caption", "Fett mit Kontur"), ("subtitle", "Mit Kasten"), ("yellow", "Gelb (Highlight)"),
-              ("meme", "Meme"), ("neon", "Neon")]
+    STYLES = [("karaoke", "Karaoke (Wort für Wort)"), ("caption", "Fett mit Kontur"), ("subtitle", "Mit Kasten"),
+              ("yellow", "Gelb (Highlight)"), ("meme", "Meme"), ("neon", "Neon")]
 
     def __init__(self, app):
         super().__init__(app, "Auto-Untertitel", 520)
@@ -1982,6 +2109,87 @@ class CaptionDialog(DialogBase):
 # ════════════════════════════════════════════════════════════════════════════
 #  Hauptfenster
 # ════════════════════════════════════════════════════════════════════════════
+def parse_version(s):
+    return tuple(int(x) for x in re.findall(r"\d+", s or "")[:3]) or (0,)
+
+
+def is_installed():
+    """Nur die per Installer installierte exe aktualisiert sich selbst."""
+    return FROZEN and (Path(sys.executable).parent / "unins000.exe").exists()
+
+
+class Updater(QObject):
+    """Prüft GitHub-Releases auf eine neuere Version und lädt den Installer im Hintergrund."""
+    info = Signal(str)
+    available = Signal(str, str)      # Version, Release-Seite (nicht installiert → nur Hinweis)
+    ready = Signal(str, str)          # Version, Pfad zum heruntergeladenen Installer
+
+    def __init__(self):
+        super().__init__()
+        self.busy = False
+
+    def check(self, manual=False):
+        if self.busy:
+            return
+        self.busy = True
+        threading.Thread(target=self._run, args=(manual,), daemon=True).start()
+
+    def _run(self, manual):
+        try:
+            req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                                         headers={"User-Agent": "NeonCut-Updater",
+                                                  "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            tag = data.get("tag_name", "")
+            if parse_version(tag) <= parse_version(VERSION):
+                if manual:
+                    self.info.emit(f"NeonCut ist aktuell (Version {VERSION})")
+                return
+            asset = next((a for a in data.get("assets", [])
+                          if a["name"].lower().startswith("neoncut-setup") and a["name"].lower().endswith(".exe")), None)
+            if not is_installed() or asset is None:
+                self.available.emit(tag, data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest")
+                return
+            UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+            dest = UPDATE_DIR / asset["name"]
+            if not (dest.exists() and dest.stat().st_size == asset["size"]):
+                if manual:
+                    self.info.emit(f"Lade Update {tag} herunter …")
+                tmp = dest.with_suffix(".part")
+                req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": "NeonCut-Updater"})
+                with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+                    shutil.copyfileobj(r, f, 1 << 16)
+                if tmp.stat().st_size != asset["size"]:
+                    tmp.unlink(missing_ok=True)
+                    raise IOError("Download unvollständig")
+                tmp.replace(dest)
+            self.ready.emit(tag, str(dest))
+        except Exception:
+            if manual:
+                self.info.emit("Update-Prüfung fehlgeschlagen – keine Internetverbindung?")
+        finally:
+            self.busy = False
+
+
+class BgBridge(QObject):
+    """Führt langsame Aufgaben im Hintergrund aus und meldet das Ergebnis im GUI-Thread."""
+    done = Signal(object, object)
+
+    def __init__(self):
+        super().__init__()
+        self.done.connect(lambda cb, res: cb(res))
+
+    def run(self, fn, cb):
+        def work():
+            try:
+                res = fn()
+            except Exception as e:
+                res = e
+            self.done.emit(cb, res)
+        threading.Thread(target=work, daemon=True).start()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2023,7 +2231,26 @@ class MainWindow(QMainWindow):
         self.autosave_timer = QTimer(self, interval=15000, timeout=self.autosave)
         self.autosave_timer.start()
         self.filter_timer = QTimer(self, singleShot=True, interval=180, timeout=self._update_filter_thumbs)
+        self.kf_ui_timer = QTimer(self, singleShot=True, interval=160, timeout=self._refresh_kf_ui)
         QApplication.instance().installEventFilter(self)
+
+        self.bg = BgBridge()
+        self.voices = []
+        self.bg.run(E.tts_voices, lambda v: setattr(self, "voices", v if isinstance(v, list) else []))
+        self.updater = Updater()
+        self.updater.info.connect(self.toast)
+        self.updater.available.connect(self._update_available)
+        self.updater.ready.connect(self._update_ready)
+        self._pending_update = None
+        self._update_url = None
+        if "--screenshot" not in sys.argv and "--selftest" not in sys.argv:
+            if self.settings.get("auto_update", True):
+                QTimer.singleShot(8000, self.updater.check)
+            self.update_timer = QTimer(self, interval=6 * 3600 * 1000,
+                                       timeout=lambda: self.settings.get("auto_update", True) and self.updater.check())
+            self.update_timer.start()
+        if "--updated" in sys.argv:
+            QTimer.singleShot(1500, lambda: self.toast(f"NeonCut wurde auf Version {VERSION} aktualisiert"))
 
     # ── UI ──────────────────────────────────────────────────────────────────
     def _build(self):
@@ -2153,6 +2380,15 @@ class MainWindow(QMainWindow):
         h.addWidget(self.undo_btn)
         h.addWidget(self.redo_btn)
         h.addSpacing(6)
+        self.update_btn = QPushButton()
+        self.update_btn.setIcon(icon("export", "#ffffff"))
+        self.update_btn.setCursor(Qt.PointingHandCursor)
+        self.update_btn.setStyleSheet(f"QPushButton {{ background: #10b981; border: 1px solid #10b981; color: white; }}"
+                                      f"QPushButton:hover {{ background: #22c58f; }}")
+        self.update_btn.setToolTip("Speichert, installiert das Update und startet NeonCut neu")
+        self.update_btn.clicked.connect(lambda: self.install_update(relaunch=True))
+        self.update_btn.hide()
+        h.addWidget(self.update_btn)
         fb = QPushButton("Datei")
         fb.setObjectName("ghost")
         fb.setCursor(Qt.PointingHandCursor)
@@ -2198,6 +2434,8 @@ class MainWindow(QMainWindow):
         h.addWidget(self._tool("Ton abtrennen", "music", "Ton des Clips auf die Musikspur legen", self.detach_audio))
         h.addWidget(self._tool("Text", "plus", "Text hinzufügen", lambda: self.add_text("title")))
         h.addWidget(self._tool("Untertitel", "cc", "Auto-Untertitel erstellen", self.auto_captions))
+        mk = self._tool("Marker", "sparkle", "Marker & Beats (M = Marker am Strich)", lambda: self._marker_menu(mk))
+        h.addWidget(mk)
         h.addStretch()
         self.snap_btn = QPushButton()
         self.snap_btn.setCheckable(True)
@@ -2366,8 +2604,14 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction("Medien importieren …\tStrg+I", self.import_dialog)
         m.addAction("Aktuelles Bild als PNG speichern …", self.save_frame)
+        m.addAction("Nur Ton exportieren (MP3 / WAV) …", self.export_audio)
         m.addAction("Exportieren …\tStrg+E", self.export)
         m.addSeparator()
+        m.addAction("Nach Updates suchen", self._manual_update_check)
+        au = m.addAction("Automatisch aktualisieren")
+        au.setCheckable(True)
+        au.setChecked(self.settings.get("auto_update", True))
+        au.toggled.connect(lambda on: (self.settings.__setitem__("auto_update", on), self.save_settings()))
         m.addAction(f"Über NeonCut {VERSION}", lambda: self.toast(f"NeonCut {VERSION} – gratis, ohne Wasserzeichen"))
         m.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
@@ -2466,6 +2710,263 @@ class MainWindow(QMainWindow):
 
     def refresh_inspector_values(self):
         self.inspector.refresh_values()
+
+    # ── Keyframes ───────────────────────────────────────────────────────────
+    def clip_kind(self, c):
+        return E.find_clip(self.proj, c["id"])[0]
+
+    def clip_local(self, c):
+        kind = self.clip_kind(c)
+        if kind is None:
+            return 0.0
+        s, e = E.span(self.proj, kind, c)
+        return max(0.0, min(e - s, self.playhead - s))
+
+    def visual_value(self, c, key):
+        if self.clip_kind(c) in ("video", "overlay"):
+            return E.kf_values(c, self.clip_local(c))[key]
+        return c.get(key, E.KF_DEFAULTS.get(key, 0.0))
+
+    def set_visual(self, c, key, value):
+        """Größe/Position/Drehung/Deckkraft setzen – mit Keyframes am weißen Strich, sonst für den ganzen Clip."""
+        if self.clip_kind(c) in ("video", "overlay") and c.get("kf"):
+            E.kf_set(c, self.clip_local(c), key, value)
+        else:
+            c[key] = value
+
+    def toggle_keyframe(self, c):
+        local = self.clip_local(c)
+        k = E.kf_at(c, local)
+        if k is not None:
+            self.modify(None, lambda: c["kf"].remove(k))
+            self.toast("Keyframe entfernt")
+        else:
+            self.modify(None, lambda: E.kf_set(c, local))
+            if len(c["kf"]) == 1:
+                self.toast("Erster Keyframe gesetzt – Strich verschieben und Größe oder Position ändern")
+            else:
+                self.toast("Keyframe gesetzt")
+        self.inspector.rebuild()
+
+    def jump_keyframe(self, c, d):
+        kind = self.clip_kind(c)
+        s, _ = E.span(self.proj, kind, c)
+        local = self.clip_local(c)
+        times = [k["t"] for k in c.get("kf") or []]
+        cand = [t for t in times if t > local + 0.02] if d > 0 else [t for t in times if t < local - 0.02]
+        if not cand:
+            self.toast("Kein weiterer Keyframe")
+            return
+        self.seek(s + (min(cand) if d > 0 else max(cand)))
+
+    def clear_keyframes(self, c):
+        self.modify(None, lambda: c.__setitem__("kf", []))
+        self.inspector.rebuild()
+
+    def _refresh_kf_ui(self):
+        kind = self.inspector.kind
+        if kind not in ("video", "image", "overlay", "overlay_img"):
+            return
+        tabs = Inspector.TABS[kind]
+        if tabs[min(self.inspector.tab_idx.get(kind, 0), len(tabs) - 1)] != "Bild":
+            return
+        c = self.selected_visual()
+        if c and c.get("kf"):
+            sb = self.inspector.scroll.verticalScrollBar()
+            pos = sb.value()
+            self.inspector.rebuild()
+            QTimer.singleShot(0, lambda: self.inspector.scroll.verticalScrollBar().setValue(pos))
+
+    def preview_clip(self, c):
+        kind = self.clip_kind(c)
+        if kind is None:
+            return
+        if self.player.playing:
+            self.toggle_play()
+        self.seek(E.span(self.proj, kind, c)[0])
+        self.toggle_play()
+
+    # ── Marker & Beats ──────────────────────────────────────────────────────
+    def toggle_marker(self):
+        t = round(self.playhead, 3)
+        ms = self.proj.setdefault("markers", [])
+        near = [m for m in ms if abs(m - t) * self.timeline.pps < 6]
+
+        def fn():
+            if near:
+                ms.remove(near[0])
+            else:
+                ms.append(t)
+                ms.sort()
+        self.modify(None, fn)
+        self.toast("Marker entfernt" if near else "Marker gesetzt")
+
+    def jump_marker(self, d):
+        ms = sorted(self.proj.get("markers", []))
+        cand = [m for m in ms if m > self.playhead + 0.01] if d > 0 else [m for m in ms if m < self.playhead - 0.01]
+        if cand:
+            self.seek(min(cand) if d > 0 else max(cand))
+
+    def _marker_menu(self, btn):
+        m = styled_menu(self)
+        m.addAction("Marker am Strich setzen / entfernen\tM", self.toggle_marker)
+        m.addAction("Beats der Musik markieren", lambda: self.mark_beats(None))
+        m.addSeparator()
+        m.addAction("Video an allen Markern teilen", self.split_at_markers)
+        m.addAction("Zum nächsten Marker", lambda: self.jump_marker(1))
+        m.addAction("Zum vorherigen Marker", lambda: self.jump_marker(-1))
+        m.addSeparator()
+        m.addAction("Alle Marker löschen", lambda: self.modify(None, lambda: self.proj.__setitem__("markers", [])))
+        m.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def split_at_markers(self):
+        ms = sorted(self.proj.get("markers", []))
+        if not ms:
+            self.toast("Noch keine Marker – M drücken oder „Beats der Musik markieren“")
+            return
+        self.begin_change()
+        n = 0
+        for t in ms:
+            item = next((x for x in E.layout(self.proj) if x[1] + E.MIN_LEN < t < x[2] - E.MIN_LEN), None)
+            if item:
+                self._split_clip("video", item[0], t)
+                n += 1
+        self.end_change()
+        self.toast(f"{n} Schnitte an den Markern gesetzt")
+
+    def mark_beats(self, c):
+        if c is None:
+            sel = E.find_clip(self.proj, self.sel[1])[1] if self.sel else None
+            if sel is not None and self.proj["media"].get(sel.get("media"), {}).get("has_audio"):
+                c = sel
+            elif self.proj["audio"]:
+                c = self.proj["audio"][0]
+        if c is None:
+            self.toast("Füge zuerst Musik hinzu (grüne Spur)")
+            return
+        kind = self.clip_kind(c)
+        m = self.proj["media"][c["media"]]
+        s, e = E.span(self.proj, kind, c)
+        sp = c.get("speed", 1.0)
+        a, b = c["in"], c["in"] + (e - s) * sp
+        b = min(b, a + 900)                     # höchstens 15 Minuten auf einmal
+
+        def done(res):
+            if isinstance(res, Exception) or not res:
+                self.toast("Keine Beats gefunden")
+                return
+            new = [round(s + bt / sp, 3) for bt in res if s + bt / sp < e]
+
+            def fn():
+                ms = self.proj.setdefault("markers", [])
+                for t in new:
+                    if all(abs(t - x) > 0.05 for x in ms):
+                        ms.append(t)
+                ms.sort()
+            self.modify(None, fn)
+            self.toast(f"{len(new)} Beats markiert – „Marker → Video an allen Markern teilen“ schneidet im Takt")
+        self.toast("Suche Beats …")
+        self.bg.run(lambda: E.detect_beats(m["path"], a, b), done)
+
+    # ── Ton ─────────────────────────────────────────────────────────────────
+    def normalize(self, c):
+        pk = self.store.peaks.get(c["media"])
+        if pk is None or not len(pk):
+            self.toast("Die Wellenform wird noch berechnet – gleich nochmal versuchen")
+            return
+        kind = self.clip_kind(c)
+        s, e = E.span(self.proj, kind, c)
+        a = int(c["in"] * 50)
+        b = max(a + 1, int((c["in"] + (e - s) * c.get("speed", 1.0)) * 50))
+        seg = pk[a:b]
+        if not len(seg) or float(seg.max()) < 1e-4:
+            self.toast("Dieser Clip ist still")
+            return
+        vol = round(min(4.0, 0.9 / float(seg.max())), 2)
+        self.modify(None, lambda: c.__setitem__("volume", vol))
+        self.inspector.refresh_values()
+        self.toast(f"Lautstärke angeglichen: {vol:.0%}")
+
+    def set_karaoke(self, c, on):
+        c["karaoke"] = on
+
+    def text_to_speech(self, c, voice):
+        text = (c.get("text") or "").strip()
+        if not text:
+            self.toast("Der Text ist leer")
+            return
+        TTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = TTS_DIR / f"sprache_{E.new_id()}.wav"
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.toast(f"Vorlesen fehlgeschlagen: {res}")
+                return
+            m = E.probe(res)
+            m["name"] = "Sprache: " + text.replace("\n", " ")[:28]
+            self.begin_change()
+            self.proj["media"][m["id"]] = m
+            self.store.load(m)
+            self.proj["audio"].append(E.audio_clip(m, c["start"]))
+            if c["dur"] < m["duration"] + 0.2:
+                c["dur"] = round(m["duration"] + 0.2, 2)
+            self.end_change()
+            self.toast("Sprache eingefügt – sie liegt auf der grünen Musikspur")
+        self.toast("Erzeuge Sprache …")
+        self.bg.run(lambda: E.tts_to_wav(text, path, voice or None), done)
+
+    def export_audio(self):
+        if E.duration(self.proj) <= 0:
+            self.toast("Die Timeline ist leer")
+            return
+        name = "".join(ch for ch in self.proj["name"] if ch not in '\\/:*?"<>|').strip() or "NeonCut"
+        start = Path(self.settings.get("export_dir") or str(Path.home() / "Music")) / f"{name}.mp3"
+        p, _ = QFileDialog.getSaveFileName(self, "Nur Ton exportieren", str(start), "MP3 (*.mp3);;WAV (*.wav)")
+        if not p:
+            return
+        if not p.lower().endswith((".mp3", ".wav")):
+            p += ".mp3"
+        job = E.AudioExportJob(self.proj, self.store, p)
+        self._audio_job = job
+        job.finished_ok.connect(lambda ok, msg: self.toast(f"Ton gespeichert: {Path(msg).name}" if ok
+                                                           else f"Ton-Export fehlgeschlagen: {msg}"))
+        job.start()
+        self.toast("Exportiere Ton …")
+
+    # ── Updates ─────────────────────────────────────────────────────────────
+    def _manual_update_check(self):
+        if self._update_url and not is_installed():
+            QDesktopServices.openUrl(QUrl(self._update_url))
+        else:
+            self.updater.check(manual=True)
+
+    def _update_available(self, tag, url):
+        self._update_url = url
+        self.toast(f"NeonCut {tag} ist verfügbar – „Datei → Nach Updates suchen“ öffnet die Download-Seite")
+
+    def _update_ready(self, tag, path):
+        self._pending_update = (tag, path)
+        self.update_btn.setText(f"  Update {tag} installieren")
+        self.update_btn.show()
+        self.toast(f"Update {tag} ist bereit – wird beim Schließen installiert (oder jetzt per Klick oben)")
+
+    def install_update(self, relaunch=True, quit_after=True):
+        if not self._pending_update:
+            return
+        tag, path = self._pending_update
+        self._installing = True
+        self.autosave()
+        args = [path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"]
+        if not relaunch:
+            args.append("/NOLAUNCH")
+        try:
+            subprocess.Popen(args, close_fds=True)
+        except OSError:
+            self._installing = False
+            self.toast("Update konnte nicht gestartet werden")
+            return
+        if quit_after:
+            QTimer.singleShot(300, self.close)
 
     def _update_filter_thumbs(self):
         if self.panels.currentIndex() != P_FILTER:
@@ -2717,6 +3218,7 @@ class MainWindow(QMainWindow):
         c2["id"] = E.new_id()
         if kind in ("video", "overlay"):
             m = self.proj["media"][c["media"]]
+            c["kf"], c2["kf"] = E.kf_split(c, local)
             if m["kind"] == "image":
                 c["out"] = c["in"] + local
                 c2["in"], c2["out"] = 0.0, e - t
@@ -2724,6 +3226,7 @@ class MainWindow(QMainWindow):
                 cut = c["in"] + local * c.get("speed", 1.0)
                 c["out"], c2["in"] = cut, cut
             c["fade_out"], c2["fade_in"] = 0.0, 0.0
+            c["anim_out"], c2["anim_in"] = "none", "none"
             if kind == "video":
                 c["trans"] = {"type": "none", "dur": c["trans"]["dur"]}
                 self.proj["video"].insert(self.proj["video"].index(c) + 1, c2)
@@ -2927,11 +3430,17 @@ class MainWindow(QMainWindow):
         if replace:
             self.proj["text"] = [t for t in self.proj["text"] if not t.get("auto")]
         H_ratio = E.ASPECTS[self.proj["aspect"]]
-        for s, e, text in lines:
-            c = E.text_clip(s, style, text)
+        karaoke = style == "karaoke"
+        for line in lines:
+            s, e, text = line[0], line[1], line[2]
+            words = [list(w) for w in line[3]] if len(line) > 3 else []
+            c = E.text_clip(s, "caption" if karaoke else style, text)
             c["dur"] = max(0.3, e - s)
             c["auto"] = True
-            c["anim_in"] = "pop" if style in ("caption", "yellow") else "fade"
+            c["words"] = words
+            c["karaoke"] = karaoke and bool(words)
+            c["hl_color"] = "#ffd60a"
+            c["anim_in"] = "pop" if style in ("caption", "yellow", "karaoke") else "fade"
             c["anim_out"] = "none"
             if style != "meme":
                 c["y"] = 0.3 if H_ratio[0] >= H_ratio[1] else 0.18
@@ -2943,7 +3452,7 @@ class MainWindow(QMainWindow):
 
     def caption_style_to_all(self, src):
         keys = ("font", "bold", "italic", "size", "color", "stroke", "stroke_w", "box", "box_color", "box_alpha",
-                "glow", "shadow", "x", "y", "anim_in", "anim_out")
+                "glow", "shadow", "x", "y", "anim_in", "anim_out", "karaoke", "hl_color")
         self.begin_change()
         n = 0
         for t in self.proj["text"]:
@@ -2975,6 +3484,8 @@ class MainWindow(QMainWindow):
         self.need_render = True
         self.timeline.update()
         self.filter_timer.start()
+        self.inspector.refresh_values()          # Keyframe-Werte am neuen Zeitpunkt anzeigen
+        self.kf_ui_timer.start()
 
     def _tick(self):
         if self.player.playing:
@@ -3061,6 +3572,8 @@ class MainWindow(QMainWindow):
             (Qt.Key_E, True): self.export, (Qt.Key_I, True): self.import_dialog,
             (Qt.Key_Plus, True): lambda: self.timeline.zoom(1.3), (Qt.Key_Minus, True): lambda: self.timeline.zoom(1 / 1.3),
             (Qt.Key_Escape, False): lambda: self.select(None),
+            (Qt.Key_M, False): self.toggle_marker,
+            (Qt.Key_K, False): lambda: self.selected_visual() and self.toggle_keyframe(self.selected_visual()),
         }
         fn = actions.get((k, ctrl))
         if fn:
@@ -3097,6 +3610,8 @@ class MainWindow(QMainWindow):
                 Path(self.proj_path).write_text(json.dumps(self.proj, ensure_ascii=False, indent=1), encoding="utf-8")
             except OSError:
                 pass
+        if self._pending_update and not getattr(self, "_installing", False):
+            self.install_update(relaunch=False, quit_after=False)      # Update still beim Beenden
         self.renderer.close()
         self.thumb_renderer.close()
         super().closeEvent(e)
